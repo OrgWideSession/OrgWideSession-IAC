@@ -58,6 +58,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
     id     = "expire-old-versions"
     status = "Enabled"
 
+    # filter is required by the AWS provider (even when the rule applies to all objects).
+    # An empty filter block means: apply this rule to every object in the bucket.
+    filter {}
+
     noncurrent_version_expiration {
       noncurrent_days = 30   # Increase for prod if longer recovery windows are needed
     }
