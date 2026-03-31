@@ -32,6 +32,13 @@ on:
 #   terraform-development  (for dev pushes/PRs)
 #   terraform-main        (for prod pushes/PRs)
 # cancel-in-progress: false ensures an in-progress apply is never killed mid-run.
+# Grant the GITHUB_TOKEN the minimum permissions this workflow needs.
+# pull-requests: write — allows posting the plan output as a PR comment (plan job).
+# contents: read      — allows checking out the repository code (all jobs).
+permissions:
+  contents: read
+  pull-requests: write
+
 concurrency:
   group: terraform-${{ github.ref_name }}
   cancel-in-progress: false
@@ -193,7 +200,8 @@ jobs:
         run: |
           terraform plan \
             -out=tfplan \
-            -input=false
+            -input=false \
+            -no-color
 
       # Upload the plan binary as a workflow artifact.
       # The artifact name is dynamic (tfplan-dev or tfplan-prod) so that
