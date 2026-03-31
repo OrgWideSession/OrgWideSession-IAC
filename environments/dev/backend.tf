@@ -1,16 +1,24 @@
 # Remote state configuration for the dev environment.
 # State is stored in S3 and locked via DynamoDB to prevent concurrent applies.
 #
-# Important: The backend block does not support variable interpolation.
-# The actual bucket and table names are injected via -backend-config flags
-# at terraform init time (done in the GitHub Actions workflow).
+# The backend block does not support variable interpolation.
+# Bucket and table names are injected via -backend-config flags at terraform init
+# time — see the GitHub Actions workflow (TF_BACKEND_BUCKET / TF_BACKEND_DYNAMODB_TABLE secrets).
 
 terraform {
   backend "s3" {
-    bucket         = "github-session-my-org-terraform-state"       # S3 bucket holding all state files
-    key            = "dev/s3/terraform.tfstate"     # Dev-specific key — isolated from prod
-    region         = "us-east-1"
-    dynamodb_table = "github-session-my-org-terraform-locks"       # DynamoDB table for state locking
-    encrypt        = true
+    # S3 bucket that holds all Terraform state files (created by bootstrap/)
+    bucket = "github-session-my-org-terraform-state"
+
+    # Dev-specific key — isolated from prod (prod uses prod/s3/terraform.tfstate)
+    key = "dev/s3/terraform.tfstate"
+
+    region = "us-east-1"
+
+    # DynamoDB table that provides state locking (prevents concurrent applies)
+    dynamodb_table = "github-session-my-org-terraform-locks"
+
+    # Encrypt state at rest — always enable this
+    encrypt = true
   }
 }

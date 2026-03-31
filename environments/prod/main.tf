@@ -1,6 +1,7 @@
 # Prod environment entry point.
 # Calls the shared S3 module with prod-specific variable values.
-# The module prepends var.environment to var.name_suffix to form the bucket name.
+# The module prepends environment="prod" to name_suffix to form the bucket name:
+#   "prod-orgwidesession-app-assets"
 
 terraform {
   required_version = ">= 1.5.0"
@@ -23,7 +24,7 @@ provider "aws" {
 module "app_bucket" {
   source = "../../modules/s3"
 
-  environment        = var.environment    # "prod" → bucket name will be "prod-<name_suffix>"
+  environment        = var.environment
   name_suffix        = var.name_suffix
   versioning_enabled = var.versioning_enabled
   tags               = var.tags
