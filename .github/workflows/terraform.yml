@@ -1,0 +1,298 @@
+# terraform.yml - Unified Terraform CI/CD workflow.
+#
+# A single workflow handles both dev and prod environments.
+# The target environment is determined by the branch that triggered the run:
+#   development branch  →  dev environment  (environments/dev/)
+#   main branch        →  prod environment (environments/prod/)
+#
+# Job chain: setup → validate → plan → apply
+# Apply runs only on push events (not on PRs).
+
+name: "Terraform - Unified"
+
+on:
+  pull_request:
+    branches:
+      - main
+      - development              # Note: intentional spelling — this is the actual branch name
+    paths:
+      - "environments/**"       # Any change under any environment folder
+      - "modules/**"            # Any change to shared modules
+
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - "environments/**"
+      - "modules/**"
+
+# Concurrency: prevent two runs from applying to the same environment simultaneously.
+# The group key uses the branch name, producing:
+#   terraform-development  (for dev pushes/PRs)
+#   terraform-main        (for prod pushes/PRs)
+# cancel-in-progress: false ensures an in-progress apply is never killed mid-run.
+concurrency:
+  group: terraform-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 1: SETUP — Branch detection and environment mapping
+  #
+  # This job runs first and exports three outputs consumed by all
+  # subsequent jobs:
+  #   environment  — "dev" or "prod"
+  #   working_dir  — "environments/dev" or "environments/prod"
+  #   artifact_name — "tfplan-dev" or "tfplan-prod"
+  # ─────────────────────────────────────────────────────────────────
+  setup:
+    name: "Setup — Detect Environment"
+    runs-on: ubuntu-latest
+
+    outputs:
+      environment:   ${{ steps.set-env.outputs.environment }}
+      working_dir:   ${{ steps.set-env.outputs.working_dir }}
+      artifact_name: ${{ steps.set-env.outputs.artifact_name }}
+
+    steps:
+      - name: Determine target environment from branch
+        id: set-env
+        run: |
+          # For push events, github.ref_name is the branch being pushed to.
+          # For pull_request events, github.base_ref is the PR's target branch.
+          # We use base_ref for PRs so that a PR targeting main gets a prod plan,
+          # and a PR targeting development gets a dev plan.
+
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BRANCH="${{ github.base_ref }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+          fi
+
+          echo "Target branch: $BRANCH"
+
+          if [ "$BRANCH" == "development" ]; then
+            echo "environment=dev"          >> $GITHUB_OUTPUT
+            echo "working_dir=environments/dev" >> $GITHUB_OUTPUT
+            echo "artifact_name=tfplan-dev" >> $GITHUB_OUTPUT
+          elif [ "$BRANCH" == "main" ]; then
+            echo "environment=prod"           >> $GITHUB_OUTPUT
+            echo "working_dir=environments/prod" >> $GITHUB_OUTPUT
+            echo "artifact_name=tfplan-prod"  >> $GITHUB_OUTPUT
+          else
+            echo "ERROR: Unrecognised branch '$BRANCH'. Must be 'development' or 'main'."
+            exit 1
+          fi
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 2: VALIDATE — Format check and syntax validation
+  #
+  # Runs on every trigger (PR and push).
+  # Does not change any infrastructure.
+  # ─────────────────────────────────────────────────────────────────
+  validate:
+    name: "Validate"
+    runs-on: ubuntu-latest
+    needs: setup    # Must know working_dir before running
+
+    env:
+      # Credentials: select dev or prod secrets based on the environment output.
+      # GitHub Actions does not support dynamic secret name resolution, so we use
+      # the conditional AND/OR expression pattern as a workaround.
+      AWS_ACCESS_KEY_ID: >-
+        ${{ needs.setup.outputs.environment == 'dev'
+            && secrets.AWS_ACCESS_KEY_ID_DEV
+            || secrets.AWS_ACCESS_KEY_ID_PROD }}
+      AWS_SECRET_ACCESS_KEY: >-
+        ${{ needs.setup.outputs.environment == 'dev'
+            && secrets.AWS_SECRET_ACCESS_KEY_DEV
+            || secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+      AWS_DEFAULT_REGION: us-east-1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"    # Always pin — never use 'latest' in CI
+
+      # terraform init downloads providers and configures the backend.
+      # -backend-config flags inject the state bucket/table names from secrets,
+      # since the backend block in .tf files cannot use variable interpolation.
+      - name: Terraform Init
+        working-directory: ${{ needs.setup.outputs.working_dir }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB_TABLE }}" \
+            -input=false
+
+      # -check: exits with code 1 if any file is not correctly formatted.
+      # -recursive: checks all subdirectories too.
+      # Fix locally with: terraform fmt -recursive
+      - name: Terraform Format Check
+        working-directory: ${{ needs.setup.outputs.working_dir }}
+        run: terraform fmt -check -recursive
+
+      # Validates configuration syntax and internal consistency.
+      # Does not connect to AWS — purely a static check.
+      - name: Terraform Validate
+        working-directory: ${{ needs.setup.outputs.working_dir }}
+        run: terraform validate
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 3: PLAN — Generate and review the execution plan
+  #
+  # Runs on every trigger (PR and push).
+  # Saves the plan as a workflow artifact so apply uses exactly this plan.
+  # Posts the plan output as a PR comment for human review.
+  # ─────────────────────────────────────────────────────────────────
+  plan:
+    name: "Plan"
+    runs-on: ubuntu-latest
+    needs: [setup, validate]
+
+    env:
+      AWS_ACCESS_KEY_ID: >-
+        ${{ needs.setup.outputs.environment == 'dev'
+            && secrets.AWS_ACCESS_KEY_ID_DEV
+            || secrets.AWS_ACCESS_KEY_ID_PROD }}
+      AWS_SECRET_ACCESS_KEY: >-
+        ${{ needs.setup.outputs.environment == 'dev'
+            && secrets.AWS_SECRET_ACCESS_KEY_DEV
+            || secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+      AWS_DEFAULT_REGION: us-east-1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        working-directory: ${{ needs.setup.outputs.working_dir }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB_TABLE }}" \
+            -input=false
+
+      # Generate the plan and save it to a binary file.
+      # -out=tfplan: save plan for use in apply job
+      # -input=false: disable interactive prompts (essential for CI)
+      # The plan file is later uploaded as an artifact and downloaded by apply.
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ needs.setup.outputs.working_dir }}
+        run: |
+          terraform plan \
+            -out=tfplan \
+            -input=false
+
+      # Upload the plan binary as a workflow artifact.
+      # The artifact name is dynamic (tfplan-dev or tfplan-prod) so that
+      # simultaneous runs on different branches do not overwrite each other.
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.setup.outputs.artifact_name }}
+          path: ${{ needs.setup.outputs.working_dir }}/tfplan
+          retention-days: 1    # Short retention — the plan is only valid for this run
+
+      # Post the plan output as a comment on the PR.
+      # Only runs on pull_request events — no point commenting on a push.
+      # Reviewers read this comment to understand what will change before approving.
+      - name: Post Plan Output to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_OUTPUT: ${{ steps.plan.outputs.stdout }}
+        with:
+          script: |
+            const env = "${{ needs.setup.outputs.environment }}".toUpperCase();
+            const body = `### Terraform Plan — ${env} Environment
+            \`\`\`hcl
+            ${process.env.PLAN_OUTPUT}
+            \`\`\`
+            *Workflow run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ─────────────────────────────────────────────────────────────────
+  # JOB 4: APPLY — Execute the saved plan
+  #
+  # Runs ONLY on push events (not PRs).
+  # Uses the GitHub Environment named after the target environment
+  # (dev or prod) to enforce approval requirements.
+  # Downloads and applies the exact plan that was reviewed in the plan job.
+  # ─────────────────────────────────────────────────────────────────
+  apply:
+    name: "Apply"
+    runs-on: ubuntu-latest
+    needs: [setup, plan]
+
+    # Only apply on direct pushes (merges), not on pull request events.
+    # PR events are read-only — plan + review only.
+    if: github.event_name == 'push'
+
+    # The environment name is dynamic — resolves to "dev" or "prod".
+    # GitHub uses the environment's protection rules (required reviewers,
+    # deployment branch rules) to gate this job before it runs.
+    # Configure environments at: Repo → Settings → Environments
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+
+    env:
+      AWS_ACCESS_KEY_ID: >-
+        ${{ needs.setup.outputs.environment == 'dev'
+            && secrets.AWS_ACCESS_KEY_ID_DEV
+            || secrets.AWS_ACCESS_KEY_ID_PROD }}
+      AWS_SECRET_ACCESS_KEY: >-
+        ${{ needs.setup.outputs.environment == 'dev'
+            && secrets.AWS_SECRET_ACCESS_KEY_DEV
+            || secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+      AWS_DEFAULT_REGION: us-east-1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        working-directory: ${{ needs.setup.outputs.working_dir }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB_TABLE }}" \
+            -input=false
+
+      # Download the plan artifact that was generated and reviewed in the plan job.
+      # This ensures apply executes exactly what was reviewed — not a freshly
+      # generated plan that could theoretically differ.
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.setup.outputs.artifact_name }}
+          path: ${{ needs.setup.outputs.working_dir }}
+
+      # Apply the saved plan.
+      # -input=false: no interactive prompts.
+      # The tfplan file contains the complete execution plan including all resource changes.
+      - name: Terraform Apply
+        working-directory: ${{ needs.setup.outputs.working_dir }}
+        run: terraform apply -input=false tfplan
