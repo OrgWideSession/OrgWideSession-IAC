@@ -7,6 +7,14 @@
 #
 # Job chain: setup → validate → plan → apply
 # Apply runs only on push events (not on PRs).
+#
+# terraform_wrapper is set to false on all jobs.
+# The default wrapper (true) buffers stdout so Terraform can expose it as a
+# step output, but it corrupts the binary plan file written by
+# "terraform plan -out=tfplan". The apply job then receives an invalid file
+# and falls back to running a fresh plan instead of applying the saved one.
+# With wrapper=false the binary is written cleanly; plan text is captured
+# via tee to a file and read back for the PR comment.
 
 name: "Terraform - Unified"
 
@@ -125,6 +133,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"    # Always pin — never use 'latest' in CI
+          terraform_wrapper: false       # Must be false — wrapper corrupts binary plan files
 
       # terraform init downloads providers and configures the backend.
       # -backend-config flags inject the state bucket/table names from secrets,
@@ -181,6 +190,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"
+          terraform_wrapper: false       # Must be false — wrapper corrupts binary plan files
 
       - name: Terraform Init
         working-directory: ${{ needs.setup.outputs.working_dir }}
@@ -190,27 +200,28 @@ jobs:
             -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB_TABLE }}" \
             -input=false
 
-      # Generate the plan and save it to a binary file.
-      # -out=tfplan: save plan for use in apply job
-      # -input=false: disable interactive prompts (essential for CI)
-      # The plan file is later uploaded as an artifact and downloaded by apply.
+      # Generate the plan. The binary (-out=tfplan) is consumed by the apply job.
+      # tee captures human-readable output to plan_output.txt for the PR comment.
+      # -no-color strips ANSI codes so the comment renders cleanly.
       - name: Terraform Plan
-        id: plan
         working-directory: ${{ needs.setup.outputs.working_dir }}
         run: |
           terraform plan \
             -out=tfplan \
             -input=false \
-            -no-color
+            -no-color \
+            2>&1 | tee plan_output.txt
 
-      # Upload the plan binary as a workflow artifact.
+      # Upload both the binary plan (for apply) and text output (for debugging).
       # The artifact name is dynamic (tfplan-dev or tfplan-prod) so that
       # simultaneous runs on different branches do not overwrite each other.
       - name: Upload Plan Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ needs.setup.outputs.artifact_name }}
-          path: ${{ needs.setup.outputs.working_dir }}/tfplan
+          path: |
+            ${{ needs.setup.outputs.working_dir }}/tfplan
+            ${{ needs.setup.outputs.working_dir }}/plan_output.txt
           retention-days: 1    # Short retention — the plan is only valid for this run
 
       # Post the plan output as a comment on the PR.
@@ -219,14 +230,17 @@ jobs:
       - name: Post Plan Output to PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
-        env:
-          PLAN_OUTPUT: ${{ steps.plan.outputs.stdout }}
         with:
           script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync(
+              '${{ needs.setup.outputs.working_dir }}/plan_output.txt',
+              'utf8'
+            );
             const env = "${{ needs.setup.outputs.environment }}".toUpperCase();
             const body = `### Terraform Plan — ${env} Environment
-            \`\`\`hcl
-            ${process.env.PLAN_OUTPUT}
+            \`\`\`
+            ${planOutput}
             \`\`\`
             *Workflow run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`;
 
@@ -280,6 +294,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"
+          terraform_wrapper: false       # Must be false — wrapper corrupts binary plan files
 
       - name: Terraform Init
         working-directory: ${{ needs.setup.outputs.working_dir }}
